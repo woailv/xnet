@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"sync"
 )
 
 type XConn interface {
@@ -11,16 +12,17 @@ type XConn interface {
 }
 
 type XConnImpl struct {
-	net.Conn
+	conn      net.Conn
 	readChan  chan []byte
 	writeChan chan []byte
 	ctx       context.Context
 	cancel    func()
+	sync.Mutex
 }
 
 func NewXConn(conn net.Conn) *XConnImpl {
 	ctx, cancel := context.WithCancel(context.Background())
-	xi := &XConnImpl{Conn: conn, readChan: make(chan []byte, 0), writeChan: make(chan []byte, 0), ctx: ctx, cancel: cancel}
+	xi := &XConnImpl{conn: conn, readChan: make(chan []byte, 0), writeChan: make(chan []byte, 0), ctx: ctx, cancel: cancel}
 	go func() { //读数据
 		for {
 			select {
@@ -28,8 +30,9 @@ func NewXConn(conn net.Conn) *XConnImpl {
 				goto END
 			default:
 				bs := make([]byte, 1024)
-				n, err := xi.Conn.Read(bs)
+				n, err := xi.conn.Read(bs)
 				if err != nil {
+					xi.cancel()
 					log.Println("读数据错误:", err.Error())
 					goto END
 				}
@@ -37,7 +40,7 @@ func NewXConn(conn net.Conn) *XConnImpl {
 			}
 		}
 	END:
-		xi.Conn.Close()
+		xi.conn.Close()
 		close(xi.readChan)
 		log.Println("退出读数据")
 	}()
@@ -48,13 +51,14 @@ func NewXConn(conn net.Conn) *XConnImpl {
 				goto END
 			case bs := <-xi.writeChan:
 				if _, err := conn.Write(bs); err != nil {
+					xi.cancel()
 					log.Println("写数据错误:", err.Error())
 					goto END
 				}
 			}
 		}
 	END:
-		xi.Conn.Close()
+		xi.conn.Close()
 		close(xi.writeChan)
 		log.Println("退出写数据")
 	}()
@@ -85,6 +89,17 @@ func (xi *XConnImpl) Write(data []byte) bool {
 	}
 }
 
+// 同步写读数据,并发安全 TOTEST
+func (xi *XConnImpl) WriteReads(in []byte) ([]byte, bool) {
+	xi.Lock()
+	defer xi.Unlock()
+	if !xi.Write(in) {
+		return nil, false
+	}
+	return xi.Read()
+}
+
 func (xi *XConnImpl) Close() {
+	log.Println("服务端主动关闭")
 	xi.cancel()
 }
