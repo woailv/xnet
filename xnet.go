@@ -66,26 +66,22 @@ func NewXConn(conn net.Conn) *XConnImpl {
 }
 
 func (xi *XConnImpl) Read() ([]byte, bool) {
-	for {
-		select {
-		case <-xi.ctx.Done():
-			return nil, false
-		default:
-			bs := <-xi.readChan
-			return bs, true
-		}
+	select {
+	case <-xi.ctx.Done():
+		return nil, false
+	default:
+		bs := <-xi.readChan
+		return bs, true
 	}
 }
 
 func (xi *XConnImpl) Write(data []byte) bool {
-	for {
-		select {
-		case <-xi.ctx.Done():
-			return false
-		default:
-			xi.writeChan <- data
-			return true
-		}
+	select {
+	case <-xi.ctx.Done():
+		return false
+	default:
+		xi.writeChan <- data
+		return true
 	}
 }
 
