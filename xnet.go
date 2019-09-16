@@ -2,6 +2,7 @@ package xnet
 
 import (
 	"context"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -29,14 +30,10 @@ func NewXConn(conn net.Conn) *XConnImpl {
 			case <-ctx.Done():
 				goto END
 			default:
-				bs := make([]byte, 1024)
-				n, err := xi.conn.Read(bs)
-				if err != nil {
+				if !xi.read() {
 					xi.cancel()
-					log.Println("读数据错误:", err.Error())
 					goto END
 				}
-				xi.readChan <- bs[0:n]
 			}
 		}
 	END:
@@ -50,7 +47,7 @@ func NewXConn(conn net.Conn) *XConnImpl {
 			case <-ctx.Done():
 				goto END
 			case bs := <-xi.writeChan:
-				if _, err := conn.Write(bs); err != nil {
+				if _, err := xi.conn.Write(append(int2Bytes(len(bs)), bs...)); err != nil {
 					xi.cancel()
 					log.Println("写数据错误:", err.Error())
 					goto END
@@ -65,6 +62,51 @@ func NewXConn(conn net.Conn) *XConnImpl {
 	return xi
 }
 
+func (xi *XConnImpl) read() bool {
+	bodyLenbs := make([]byte, 4)
+	n, err := xi.conn.Read(bodyLenbs)
+	if err != nil {
+		log.Println("读数据体长度错误:", err.Error())
+		return false
+	}
+	if n < 4 {
+		log.Printf("读到数据体长度字节数:%d,不足4个字节", n)
+		return false
+	}
+	bodyLen := bytes2Int(bodyLenbs)
+	body := make([]byte, 0)
+	for {
+		stepData := make([]byte, 1024)
+		n, err = xi.conn.Read(stepData)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Println("读数据体错误:", err.Error())
+			return false
+		}
+		if n == 0 {
+			break
+		}
+		body = append(body, stepData[:n]...)
+		if len(body) == bodyLen {
+			break
+		}
+	}
+	if len(body) < bodyLen {
+		log.Println("读数据体字节长度不足错误:", err.Error())
+		return false
+	}
+	xi.readChan <- body
+	return true
+}
+
+func (xi *XConnImpl) Close() {
+	log.Println("服务端主动关闭")
+	xi.cancel()
+}
+
+// 纯发送数据读写，不带额外信息及定义的协议
 func (xi *XConnImpl) Read() ([]byte, bool) {
 	select {
 	case <-xi.ctx.Done():
@@ -93,9 +135,4 @@ func (xi *XConnImpl) WriteReads(in []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return xi.Read()
-}
-
-func (xi *XConnImpl) Close() {
-	log.Println("服务端主动关闭")
-	xi.cancel()
 }
