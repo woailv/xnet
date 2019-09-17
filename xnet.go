@@ -1,7 +1,10 @@
 package xnet
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -9,21 +12,33 @@ import (
 )
 
 type XConn interface {
-	net.Conn
+	ReadStr() (string, bool)
+	WriteStr(str string) bool
+	WriteReadStrs(str string) (string, bool)
+	WriteStrReadJsons(str string, out interface{}) bool
+	Close()
 }
 
-type XConnImpl struct {
+type xconnImpl struct {
 	conn      net.Conn
 	readChan  chan []byte
 	writeChan chan []byte
 	ctx       context.Context
 	cancel    func()
 	sync.Mutex
+	oneceFunc sync.Once
 }
 
-func NewXConn(conn net.Conn) *XConnImpl {
+func NewXConn(conn net.Conn) XConn {
 	ctx, cancel := context.WithCancel(context.Background())
-	xi := &XConnImpl{conn: conn, readChan: make(chan []byte, 0), writeChan: make(chan []byte, 0), ctx: ctx, cancel: cancel}
+	xi := &xconnImpl{
+		conn:      conn,
+		readChan:  make(chan []byte, 0),
+		writeChan: make(chan []byte, 0),
+		ctx:       ctx,
+		cancel:    cancel,
+		// oneceFunc:sync.Once{}
+	}
 	go func() { //读数据
 		for {
 			select {
@@ -31,7 +46,7 @@ func NewXConn(conn net.Conn) *XConnImpl {
 				goto END
 			default:
 				if !xi.read() {
-					xi.cancel()
+					xi.Close()
 					goto END
 				}
 			}
@@ -48,21 +63,20 @@ func NewXConn(conn net.Conn) *XConnImpl {
 				goto END
 			case bs := <-xi.writeChan:
 				if _, err := xi.conn.Write(append(int2Bytes(len(bs)), bs...)); err != nil {
-					xi.cancel()
+					xi.Close()
 					log.Println("写数据错误:", err.Error())
 					goto END
 				}
 			}
 		}
 	END:
-		xi.conn.Close()
 		close(xi.writeChan)
 		log.Println("退出写数据")
 	}()
 	return xi
 }
 
-func (xi *XConnImpl) read() bool {
+func (xi *xconnImpl) read() bool {
 	bodyLenbs := make([]byte, 4)
 	n, err := xi.conn.Read(bodyLenbs)
 	if err != nil {
@@ -74,9 +88,21 @@ func (xi *XConnImpl) read() bool {
 		return false
 	}
 	bodyLen := bytes2Int(bodyLenbs)
+	log.Println("要读取的数据体长度:", bodyLen)
 	body := make([]byte, 0)
+	if bodyLen <= 0 {
+		xi.readChan <- body
+		return true
+	}
+	readLen := bodyLen //剩余读取字节数
 	for {
-		stepData := make([]byte, 1024)
+		stepLen := 1024
+		if stepLen > readLen {
+			stepLen = readLen
+		}
+		log.Println("读取字节步长:", stepLen)
+		stepData := make([]byte, stepLen)
+		log.Println("reading...")
 		n, err = xi.conn.Read(stepData)
 		if err != nil {
 			if err == io.EOF {
@@ -85,6 +111,8 @@ func (xi *XConnImpl) read() bool {
 			log.Println("读数据体错误:", err.Error())
 			return false
 		}
+		readLen -= n
+		log.Println("单次读取字节数:", n)
 		if n == 0 {
 			break
 		}
@@ -101,13 +129,16 @@ func (xi *XConnImpl) read() bool {
 	return true
 }
 
-func (xi *XConnImpl) Close() {
-	log.Println("服务端主动关闭")
-	xi.cancel()
+func (xi *xconnImpl) Close() {
+	xi.oneceFunc.Do(func() {
+		log.Println("服务端close")
+		xi.cancel()
+		xi.conn.Close()
+	})
 }
 
 // 纯发送数据读写，不带额外信息及定义的协议
-func (xi *XConnImpl) Read() ([]byte, bool) {
+func (xi *xconnImpl) Read() ([]byte, bool) {
 	select {
 	case <-xi.ctx.Done():
 		return nil, false
@@ -117,7 +148,15 @@ func (xi *XConnImpl) Read() ([]byte, bool) {
 	}
 }
 
-func (xi *XConnImpl) Write(data []byte) bool {
+func (xi *xconnImpl) ReadStr() (string, bool) {
+	bs, ok := xi.Read()
+	if !ok {
+		return "", false
+	}
+	return string(bs), true
+}
+
+func (xi *xconnImpl) Write(data []byte) bool {
 	select {
 	case <-xi.ctx.Done():
 		return false
@@ -127,12 +166,38 @@ func (xi *XConnImpl) Write(data []byte) bool {
 	}
 }
 
+func (xi *xconnImpl) WriteStr(str string) bool {
+	return xi.Write([]byte(str))
+}
+
 // 同步写读数据,并发安全 TOTEST
-func (xi *XConnImpl) WriteReads(in []byte) ([]byte, bool) {
+func (xi *xconnImpl) WriteReads(in []byte) ([]byte, bool) {
 	xi.Lock()
 	defer xi.Unlock()
 	if !xi.Write(in) {
 		return nil, false
 	}
 	return xi.Read()
+}
+
+// 同步写字符串读json
+func (xi *xconnImpl) WriteStrReadJsons(str string, out interface{}) bool {
+	bs, ok := xi.WriteReads([]byte(str))
+	if !ok {
+		return false
+	}
+	if err := json.Unmarshal(bytes.Replace(bs, []byte{13, 10}, []byte{}, -1), out); err != nil { //已替换掉换行符
+		fmt.Sprintf("json反序列化错误,dataString:%s,errmsg:%s", string(bs), err.Error())
+		return false
+	}
+	return true
+}
+
+// 同步写字符串读字符串
+func (xi *xconnImpl) WriteReadStrs(str string) (string, bool) {
+	bs, ok := xi.WriteReads([]byte(str))
+	if !ok {
+		return "", false
+	}
+	return string(bs), true
 }
